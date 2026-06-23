@@ -29,6 +29,31 @@ COR_ACENTO       = "#40E0D0"
 
 LANCAMENTO_COD   = ""        # filtra campanhas; "" = ver tudo
 USAR_PESQUISA    = False            # False = oculta aba Pesquisa
+USAR_GOOGLE      = True             # False = oculta toda a seção Google Ads
+
+# Etapas do funil — coloque False para remover a etapa
+# O cálculo das taxas se ajusta automaticamente às etapas ativas
+FUNIL_IMPRESSOES  = True
+FUNIL_LINK_CLICKS = True
+FUNIL_PAGE_VIEW   = False
+FUNIL_LEADS       = True
+
+# Moeda — escolha a moeda do cliente:
+#   "BRL"  → R$ (Real Brasileiro)
+#   "USD"  → $ (Dólar Americano)
+#   "EUR"  → € (Euro)
+#   "ARS"  → $ (Peso Argentino)
+MOEDA            = "USD"
+
+_MOEDA_MAP = {
+    "BRL": {"simbolo": "R$", "locale": "pt-BR"},
+    "USD": {"simbolo": "$",  "locale": "en-US"},
+    "EUR": {"simbolo": "€",  "locale": "de-DE"},
+    "ARS": {"simbolo": "$",  "locale": "es-AR"},
+}
+_moeda_cfg    = _MOEDA_MAP.get(MOEDA, _MOEDA_MAP["BRL"])
+MOEDA_SIMBOLO = _moeda_cfg["simbolo"]
+MOEDA_LOCALE  = _moeda_cfg["locale"]
 
 # Metas do funil — define cores (verde/amarelo/vermelho)
 CPL_BOM          = 40.0
@@ -74,12 +99,9 @@ def download_thumb(url, d):
     except: return ""
 
 # ══ META ADS ══════════════════════════════════════════
-# Colunas de conversão somadas para "leads" nesta versão v2
+# Coluna de conversão — usa coluna "Conversões" da planilha (já soma tudo)
 CONV_COLS = [
-    "Action FB Pixel Custom (Offsite Conversion)",
-    "Action Messaging Conversations Started (Onsite Conversion)",
-    "Action Leads",
-    "Conversion Contact Total",
+    "Conversões",
 ]
 
 def load_meta():
@@ -87,7 +109,7 @@ def load_meta():
     df=pd.read_csv(URL_META)
     df=df.rename(columns={
         "Date":"date","Campaign Name":"campaign","Adset Name":"adset",
-        "Ad Name":"ad","Thumbnail URL":"thumb",
+        "Ad Name":"ad","Thumbnail URL":"thumb","Status":"status",
         "Spend (Cost, Amount Spent)":"spend",
         "Impressions":"impressions",
         "Action Link Clicks":"link_clicks",
@@ -95,12 +117,14 @@ def load_meta():
         "Clicks":"clicks",
     })
     df["date"]=pd.to_datetime(df["date"],errors="coerce")
+    if "status" not in df.columns: df["status"]=""
+    df["status"]=df["status"].astype(str).str.strip().str.upper()
     for c in ["spend","impressions","link_clicks","page_view","clicks"]:
         if c in df.columns: df[c]=to_num(df[c])
     if "clicks" not in df.columns: df["clicks"]=df["link_clicks"]  # fallback
     # Somar todas as colunas de conversão disponíveis
     df["leads"] = sum(to_num(df[c]) for c in CONV_COLS if c in df.columns)
-    print(f"     Conversões somadas: {', '.join(c for c in CONV_COLS if c in df.columns)}")
+    print(f"     Coluna: {', '.join(c for c in CONV_COLS if c in df.columns)}")
     df["is_lct"]=df["campaign"].str.contains(LANCAMENTO_COD,na=False,case=False) if LANCAMENTO_COD else True
     df=df.dropna(subset=["date"])
     print(f"     {len(df)} linhas | {df['date'].min().date()} → {df['date'].max().date()}")
@@ -167,8 +191,24 @@ def meta_daily_camps(df):
             result[key][camp]=build_daily(subset[subset["campaign"]==camp])
     return result
 
+_STATUS_PRIORITY={"ACTIVE":0,"WITH_ISSUES":1,"PAUSED":2,"ADSET_PAUSED":3,"CAMPAIGN_PAUSED":4,"ARCHIVED":5}
+
+def _pick_status(group):
+    if "status" not in group.columns: return ""
+    g=group[group["status"].notna()&(group["status"]!="")&(group["status"]!="NAN")]
+    if len(g)==0: return ""
+    last_date=g["date"].max()
+    last=g[g["date"]==last_date]
+    if (last["status"]=="ACTIVE").any(): return "ACTIVE"
+    statuses=last["status"].unique().tolist()
+    statuses.sort(key=lambda s:_STATUS_PRIORITY.get(s,99))
+    return statuses[0]
+
 def meta_raw(df):
     rows=[]
+    has_status="status" in df.columns
+    camp_st={k:_pick_status(g) for k,g in df.groupby("campaign")} if has_status else {}
+    adset_st={(c,a):_pick_status(g) for (c,a),g in df.groupby(["campaign","adset"])} if has_status else {}
     agg=df.groupby(["date","campaign","adset","is_lct"]).agg(
         spend=("spend","sum"),leads=("leads","sum"),
         impressions=("impressions","sum"),link_clicks=("link_clicks","sum"),
@@ -179,7 +219,9 @@ def meta_raw(df):
             "d":r["date"].strftime("%d/%m"),"c":str(r["campaign"]),"a":str(r["adset"]),
             "lct":bool(r["is_lct"]),"sp":round(float(r["spend"]),2),
             "ld":int(r["leads"]),"imp":int(r["impressions"]),
-            "lc":int(r["link_clicks"]),"cl":int(r["clicks"]),"pv":int(r["page_view"])
+            "lc":int(r["link_clicks"]),"cl":int(r["clicks"]),"pv":int(r["page_view"]),
+            "sc":camp_st.get(str(r["campaign"]),""),
+            "sa":adset_st.get((str(r["campaign"]),str(r["adset"])),""),
         })
     return rows
 
@@ -198,11 +240,16 @@ def meta_tables_period(df, p, img_dir):
             "cpl":round(sp/ld,2) if ld>0 else None,
             "cpm":round(sp/imp*1000,2) if imp>0 else None}
 
+    # Status usando df completo
+    camp_st={k:_pick_status(g) for k,g in df.groupby("campaign")}
+    adset_st={(c,a):_pick_status(g) for (c,a),g in df.groupby(["campaign","adset"])}
+    ad_st={(c,a,n):_pick_status(g) for (c,a,n),g in df.groupby(["campaign","adset","ad"])}
+
     camps_agg=ag(p,"campaign")
-    camps=[{"n":str(r["campaign"]),**calc_row(r)} for _,r in camps_agg.sort_values("leads",ascending=False).iterrows()]
+    camps=[{"n":str(r["campaign"]),"status":camp_st.get(str(r["campaign"]),""),**calc_row(r)} for _,r in camps_agg.sort_values("leads",ascending=False).iterrows()]
 
     adsets_agg=ag(p,["campaign","adset"])
-    adsets=[{"n":str(r["adset"]),"camp":str(r["campaign"]),**calc_row(r)} for _,r in adsets_agg.sort_values("leads",ascending=False).iterrows()]
+    adsets=[{"n":str(r["adset"]),"camp":str(r["campaign"]),"status":adset_st.get((str(r["campaign"]),str(r["adset"])),""),**calc_row(r)} for _,r in adsets_agg.sort_values("leads",ascending=False).iterrows()]
 
     # Thumbs do df completo
     df_full_thumb=df[df["thumb"].notna()&(df["thumb"].astype(str)!="nan")] if "thumb" in df.columns else pd.DataFrame()
@@ -218,6 +265,7 @@ def meta_tables_period(df, p, img_dir):
         lc=int(r["link_clicks"]); cl=int(r["clicks"]) if "clicks" in r.index else lc; ld=int(r["leads"])
         k=(str(r["ad"]),str(r["adset"]),str(r["campaign"]))
         ads.append({"n":str(r["ad"]),"adset":str(r["adset"]),"camp":str(r["campaign"]),
+            "status":ad_st.get((str(r["campaign"]),str(r["adset"]),str(r["ad"])),""),
             "thumb":thumb_map.get(k,""),"spend":sp,"imp":imp,"lc":lc,"cl":cl,"ld":ld,
             "ctr":round(lc/imp*100,2) if imp>0 else None,
             "ctr_all":round(cl/imp*100,2) if imp>0 else None,
@@ -337,6 +385,7 @@ def meta_breakdowns(df):
 
 # ══ GOOGLE ADS ════════════════════════════════════════
 URL_GOOGLE       = sheet_url("google-ads")
+URL_GOOGLE_PESQ  = sheet_url("google-ads-pesquisa")
 URL_GOOGLE_OUTROS= sheet_url("google-ads-outros")
 URL_GOOGLE_GE    = sheet_url("google-breakdown-gender")
 URL_GOOGLE_AG    = sheet_url("google-breakdown-age")
@@ -344,21 +393,53 @@ URL_GOOGLE_AG    = sheet_url("google-breakdown-age")
 AGE_MAP = {"AGE_RANGE_18_24":"18-24","AGE_RANGE_25_34":"25-34","AGE_RANGE_35_44":"35-44",
            "AGE_RANGE_45_54":"45-54","AGE_RANGE_55_64":"55-64","AGE_RANGE_65_UP":"65+"}
 
+_dfp_pesquisa = pd.DataFrame()  # global: google-ads-pesquisa
+
 def load_google():
+    global _dfp_pesquisa
     print("  Lendo google-ads...")
-    df=pd.read_csv(URL_GOOGLE)
-    df["date"]=pd.to_datetime(df["Date (Segment)"],errors="coerce")
-    df["spend"]=to_num(df["Cost (Spend, Amount Spent)"])
-    df["conversions"]=to_num(df["All Conversions"])
-    df["clicks"]=to_num(df["Clicks"])
-    df["impressions"]=to_num(df["Impressions"])
-    df["campaign"]=df["Campaign Name"]
-    df["adgroup"]=df["Ad Group Name"]
-    df["keyword"]=df["Keyword (Ad Group Criterion)"]
-    df["match_type"]=df["Match Type (Segment)"]
-    df["is_search"]=True  # campanhas search têm keywords
-    df=df.dropna(subset=["date"])
-    print(f"     Search: {len(df)} linhas | {df['date'].min().date()} → {df['date'].max().date()}")
+    # Colunas padrao para concat
+    COLS=["date","campaign","adgroup","keyword","match_type","spend","conversions","clicks","impressions","is_search"]
+    try:
+        df=pd.read_csv(URL_GOOGLE)
+        df["date"]=pd.to_datetime(df["Date (Segment)"],errors="coerce")
+        df["spend"]=to_num(df["Cost (Spend, Amount Spent)"])
+        df["conversions"]=to_num(df["All Conversions"])
+        df["clicks"]=to_num(df["Clicks"])
+        df["impressions"]=to_num(df["Impressions"])
+        df["campaign"]=df["Campaign Name"]
+        df["adgroup"]=df["Ad Group Name"]
+        df["keyword"]=df["Keyword (Ad Group Criterion)"]
+        df["match_type"]=df["Match Type (Segment)"]
+        df["is_search"]=True
+        df=df.dropna(subset=["date"])
+        df=df[df["spend"]>0]  # ignorar linhas sem spend
+        if len(df)>0:
+            print(f"     Search (keywords): {len(df)} linhas | {df['date'].min().date()} → {df['date'].max().date()}")
+        else:
+            print("     Search (keywords): vazio — cliente sem rede de pesquisa")
+            df=pd.DataFrame(columns=COLS)
+    except Exception as e:
+        print(f"     Aviso google-ads: {e}")
+        df=pd.DataFrame(columns=COLS)
+
+    # Carregar google-ads-pesquisa — fonte verdade para spend da rede de pesquisa
+    try:
+        dfp=pd.read_csv(URL_GOOGLE_PESQ)
+        dfp["date"]=pd.to_datetime(dfp["Date (Segment)"],errors="coerce")
+        dfp["spend"]=to_num(dfp["Cost (Spend, Amount Spent)"])
+        dfp["conversions"]=to_num(dfp["All Conversions"])
+        dfp["clicks"]=to_num(dfp["Clicks"])
+        dfp["impressions"]=to_num(dfp["Impressions"])
+        dfp["campaign"]=dfp["Campaign Name"]
+        dfp["adgroup"]=dfp["Ad Group Name"]
+        dfp=dfp.dropna(subset=["date"])
+        print(f"     Pesquisa (fonte spend): {len(dfp)} linhas")
+        # Guardar no df como atributo para uso em google_camps
+        _dfp_pesquisa=dfp
+    except Exception as e:
+        print(f"     Aviso google-ads-pesquisa: {e}")
+        _dfp_pesquisa=pd.DataFrame()
 
     # Carregar outros tipos (Display, PMax, etc.)
     try:
@@ -381,8 +462,43 @@ def load_google():
     except Exception as e:
         print(f"     Aviso google-ads-outros: {e}")
 
-    print(f"     Total unificado: {len(df)} linhas | {df['date'].min().date()} → {df['date'].max().date()}")
+    if len(df)>0:
+        print(f"     Total unificado: {len(df)} linhas | {df['date'].min().date()} → {df['date'].max().date()}")
+    else:
+        print("     Total unificado: 0 linhas")
     return df
+
+
+def apply_pesq_spend(df):
+    """Adiciona linhas extras com a diferença de spend entre google-ads-pesquisa e keywords.
+    Garante que a coluna date é datetime antes de processar.
+    Keywords mantêm seu spend original. A diferença entra como linha com keyword vazia
+    (será filtrada do Top Palavras-chave mas conta nos KPIs/daily/monthly agregados)."""
+    global _dfp_pesquisa
+    if _dfp_pesquisa.empty: return df
+    df = df.copy()
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+
+    extras = []
+    for camp in _dfp_pesquisa["campaign"].unique():
+        for dt in _dfp_pesquisa[_dfp_pesquisa["campaign"]==camp]["date"].unique():
+            sp_pesq = float(_dfp_pesquisa[
+                (_dfp_pesquisa["campaign"]==camp) & (_dfp_pesquisa["date"]==dt)
+            ]["spend"].sum())
+            mask = (df["campaign"]==camp) & (df["date"]==dt)
+            sp_kw = float(df[mask]["spend"].sum())
+            diff = round(sp_pesq - sp_kw, 4)
+            if diff > 0.01:
+                # Linha extra com a diferença — keyword vazia, sem conversões
+                row = {"date":dt,"campaign":camp,"adgroup":"","keyword":"__pesq_diff__",
+                       "match_type":"","spend":diff,"conversions":0,"clicks":0,
+                       "impressions":0,"is_search":True}
+                extras.append(row)
+
+    if not extras:
+        return df
+    df_extra = pd.DataFrame(extras)
+    return pd.concat([df, df_extra], ignore_index=True)
 
 def google_daily(df):
     agg=df.groupby("date").agg(spend=("spend","sum"),conversions=("conversions","sum"),
@@ -401,6 +517,7 @@ def google_daily(df):
 def google_kpis(df):
     hoje=pd.Timestamp(date.today()); ontem=hoje-pd.Timedelta(days=1)
     def kpi(p):
+        if not len(p): return {"spend":0,"conversions":0,"clicks":0,"impressions":0,"cpa":None,"ctr":None,"cpc":None}
         sp=float(p["spend"].sum()); cv=float(p["conversions"].sum())
         cl=int(p["clicks"].sum()); imp=int(p["impressions"].sum())
         return {"spend":round(sp,2),"conversions":round(cv,2),"clicks":cl,"impressions":imp,
@@ -415,30 +532,52 @@ def google_kpis(df):
 
 def google_camps(df):
     hoje=pd.Timestamp(date.today()); ontem=hoje-pd.Timedelta(days=1)
-    def camps_period(p):
+    # dfp = google-ads-pesquisa (fonte verdade para spend search)
+    global _dfp_pesquisa
+    dfp_full=_dfp_pesquisa if not _dfp_pesquisa.empty else pd.DataFrame()
+
+    def get_pesq_spend(dfp_p, camp, adgroup=None):
+        """Retorna spend real do google-ads-pesquisa para camp/adgroup."""
+        if dfp_p.empty: return None
+        mask = dfp_p["campaign"]==camp
+        if adgroup: mask = mask & (dfp_p["adgroup"]==adgroup)
+        return round(float(dfp_p[mask]["spend"].sum()), 2) if mask.any() else None
+
+    def camps_period(p, dfp_p):
         if not len(p): return []
         ag=p.groupby("campaign").agg(spend=("spend","sum"),conversions=("conversions","sum"),
             clicks=("clicks","sum"),impressions=("impressions","sum")).reset_index()
         rows=[]
         for _,r in ag.sort_values("conversions",ascending=False).iterrows():
-            sp=round(float(r["spend"]),2); cv=round(float(r["conversions"]),2)
+            camp=str(r["campaign"])
+            # Spend real vem do google-ads-pesquisa apenas para campanhas search
+            is_search_camp = p[p["campaign"]==camp]["is_search"].any()
+            sp_real=get_pesq_spend(dfp_p, camp) if is_search_camp else None
+            sp=sp_real if sp_real is not None else round(float(r["spend"]),2)
+            cv=round(float(r["conversions"]),2)
             cl=int(r["clicks"]); imp=int(r["impressions"])
             # Grupos de anúncio
-            adg=p[p["campaign"]==r["campaign"]].groupby("adgroup").agg(spend=("spend","sum"),conversions=("conversions","sum"),
+            adg=p[p["campaign"]==camp].groupby("adgroup").agg(spend=("spend","sum"),conversions=("conversions","sum"),
                 clicks=("clicks","sum"),impressions=("impressions","sum")).reset_index()
             adgroups=[]
             for _,ag2 in adg.sort_values("conversions",ascending=False).iterrows():
-                sp2=round(float(ag2["spend"]),2); cv2=round(float(ag2["conversions"]),2)
+                adg_name=str(ag2["adgroup"])
+                sp2_real=get_pesq_spend(dfp_p, camp, adg_name) if is_search_camp else None
+                sp2=sp2_real if sp2_real is not None else round(float(ag2["spend"]),2)
+                cv2=round(float(ag2["conversions"]),2)
                 cl2=int(ag2["clicks"]); imp2=int(ag2["impressions"])
-                # keywords — incluir match, impressions e ctr
-                kws=p[(p["campaign"]==r["campaign"])&(p["adgroup"]==ag2["adgroup"])].groupby("keyword").agg(
+                # Keywords com spend real; diferença vira N/A
+                kws=p[(p["campaign"]==camp)&(p["adgroup"]==adg_name)].groupby("keyword").agg(
                     spend=("spend","sum"),conversions=("conversions","sum"),
                     clicks=("clicks","sum"),impressions=("impressions","sum")).reset_index()
                 kw_list=[]
+                sp_kw_total=0.0
                 for _,k in kws.sort_values("conversions",ascending=False).iterrows():
+                    if not str(k["keyword"]).strip(): continue
                     sp_k=round(float(k["spend"]),2); cv_k=round(float(k["conversions"]),2)
                     cl_k=int(k["clicks"]); imp_k=int(k["impressions"])
-                    mt=p[(p["campaign"]==r["campaign"])&(p["adgroup"]==ag2["adgroup"])&(p["keyword"]==k["keyword"])]["match_type"]
+                    sp_kw_total+=sp_k
+                    mt=p[(p["campaign"]==camp)&(p["adgroup"]==adg_name)&(p["keyword"]==k["keyword"])]["match_type"]
                     kw_list.append({"n":str(k["keyword"]),
                         "match":str(mt.mode()[0]) if len(mt)>0 else "",
                         "spend":sp_k,"conv":cv_k,
@@ -446,17 +585,28 @@ def google_camps(df):
                         "cpc":round(sp_k/cl_k,2) if cl_k>0 else None,
                         "ctr":round(cl_k/imp_k*100,2) if imp_k>0 else None,
                         "clicks":cl_k,"imp":imp_k})
-                adgroups.append({"n":str(ag2["adgroup"]),"spend":sp2,"conv":cv2,
+                # N/A: diferença entre spend real do grupo e soma das keywords (só para search)
+                if is_search_camp:
+                    sp_na=round(sp2-sp_kw_total,2) if sp2_real is not None else round(float(ag2["spend"])-sp_kw_total,2)
+                    if sp_na>0.01:
+                        kw_list.append({"n":"N/A","match":"—","spend":sp_na,"conv":None,
+                            "cpa":None,"cpc":None,"ctr":None,"clicks":0,"imp":0})
+                adgroups.append({"n":adg_name,"spend":sp2,"conv":cv2,
                     "cpa":round(sp2/cv2,2) if cv2>0 else None,"cpc":round(sp2/cl2,2) if cl2>0 else None,
                     "ctr":round(cl2/imp2*100,2) if imp2>0 else None,"clicks":cl2,"imp":imp2,"keywords":kw_list})
-            rows.append({"n":str(r["campaign"]),"spend":sp,"conv":cv,
+            rows.append({"n":camp,"spend":sp,"conv":cv,
                 "cpa":round(sp/cv,2) if cv>0 else None,"cpc":round(sp/cl,2) if cl>0 else None,
                 "ctr":round(cl/imp*100,2) if imp>0 else None,"clicks":cl,"imp":imp,"adgroups":adgroups})
         return rows
     result={}
-    result["1"]=camps_period(df[(df["date"]>=ontem)&(df["date"]<=ontem)])
-    for n in [7,14,30]: result[str(n)]=camps_period(df[df["date"]>=hoje-pd.Timedelta(days=n-1)])
-    result["all"]=camps_period(df)
+    def filt_pesq(start, end=None):
+        if dfp_full.empty: return dfp_full
+        m = dfp_full["date"]>=start
+        if end is not None: m = m & (dfp_full["date"]<=end)
+        return dfp_full[m]
+    result["1"]=camps_period(df[(df["date"]>=ontem)&(df["date"]<=ontem)], filt_pesq(ontem, ontem))
+    for n in [7,14,30]: result[str(n)]=camps_period(df[df["date"]>=hoje-pd.Timedelta(days=n-1)], filt_pesq(hoje-pd.Timedelta(days=n-1)))
+    result["all"]=camps_period(df, dfp_full)
     return result
 
 def google_keywords(df):
@@ -466,6 +616,8 @@ def google_keywords(df):
     def kws_period(p):
         ag=p.groupby("keyword").agg(spend=("spend","sum"),conversions=("conversions","sum"),
             clicks=("clicks","sum"),impressions=("impressions","sum")).reset_index()
+        # Remover keywords vazias e linhas de ajuste de spend
+        ag=ag[~ag["keyword"].astype(str).str.strip().isin(["","__pesq_diff__"])]
         ag=ag[ag["spend"]>0].sort_values("conversions",ascending=False).head(25)
         rows=[]
         for _,k in ag.iterrows():
@@ -487,6 +639,9 @@ def google_keywords(df):
 
 def google_raw(df):
     """Raw diário — search com keywords, outros sem. Usado para filtros de data livre no HTML."""
+    df=df.copy()
+    df["date"]=pd.to_datetime(df["date"], errors="coerce")
+    df=df.dropna(subset=["date"])
     rows=[]
     # Search: com keyword
     df_search=df[df["is_search"]==True] if "is_search" in df.columns else df
@@ -538,20 +693,28 @@ def google_breakdowns(df):
         df_g["date"]=pd.to_datetime(df_g["Date (Segment)"],errors="coerce")
         df_g["spend"]=to_num(df_g["Cost (Spend, Amount Spent)"])
         df_g["conv"]=to_num(df_g["All Conversions"])
-        df_g["gender"]=df_g["Gender (Ad Group Criterion)"].str.lower()
+        df_g["gender"]=df_g["Gender (Ad Group Criterion)"].astype(str).str.lower()
         df_g=df_g.dropna(subset=["date"])
     except Exception as e: print(f"  Aviso Gender: {e}"); df_g=pd.DataFrame()
     AGE_ORDER=["18-24","25-34","35-44","45-54","55-64","65+"]
     def bd(pa, pg):
-        aa=pa[pa["age"].isin(AGE_ORDER)].groupby("age").agg(spend=("spend","sum"),conv=("conv","sum")).reset_index()
-        aa["_o"]=aa["age"].apply(lambda x:AGE_ORDER.index(x) if x in AGE_ORDER else 99)
-        aa=aa[aa["spend"]>0].sort_values("_o")
-        aa["cpl"]=(aa["spend"]/aa["conv"]).where(aa["conv"]>0).round(2)
-        ga=pg[pg["gender"].isin(["female","male"])].groupby("gender").agg(spend=("spend","sum"),conv=("conv","sum")).reset_index()
-        ga=ga[ga["spend"]>0].sort_values("conv",ascending=False)
-        ga["cpl"]=(ga["spend"]/ga["conv"]).where(ga["conv"]>0).round(2)
-        def tl(df2,dim): return [{"n":str(r[dim]),"spend":round(float(r["spend"]),2),"conv":round(float(r["conv"]),2),"cpl":safe(r["cpl"])} for _,r in df2.iterrows()]
-        return {"age":tl(aa,"age"),"gender":tl(ga,"gender")}
+        age_d=[]; gen_d=[]
+        try:
+            if len(pa)>0 and "age" in pa.columns:
+                aa=pa[pa["age"].isin(AGE_ORDER)].groupby("age").agg(spend=("spend","sum"),conv=("conv","sum")).reset_index()
+                aa["_o"]=aa["age"].apply(lambda x:AGE_ORDER.index(x) if x in AGE_ORDER else 99)
+                aa=aa[aa["spend"]>0].sort_values("_o")
+                aa["cpl"]=(aa["spend"]/aa["conv"]).where(aa["conv"]>0).round(2)
+                age_d=[{"n":str(r["age"]),"spend":round(float(r["spend"]),2),"conv":round(float(r["conv"]),2),"cpl":safe(r["cpl"])} for _,r in aa.iterrows()]
+        except Exception as e: print(f"  Aviso bd age: {e}")
+        try:
+            if len(pg)>0 and "gender" in pg.columns:
+                ga=pg[pg["gender"].isin(["female","male"])].groupby("gender").agg(spend=("spend","sum"),conv=("conv","sum")).reset_index()
+                ga=ga[ga["spend"]>0].sort_values("conv",ascending=False)
+                ga["cpl"]=(ga["spend"]/ga["conv"]).where(ga["conv"]>0).round(2)
+                gen_d=[{"n":str(r["gender"]),"spend":round(float(r["spend"]),2),"conv":round(float(r["conv"]),2),"cpl":safe(r["cpl"])} for _,r in ga.iterrows()]
+        except Exception as e: print(f"  Aviso bd gender: {e}")
+        return {"age":age_d,"gender":gen_d}
     result={}
     def filt(dfa,dfg,start,end):
         pa=dfa[(dfa["date"]>=start)&(dfa["date"]<=end)] if len(dfa)>0 else dfa
@@ -591,7 +754,11 @@ def meta_monthly(df):
 def google_monthly(df):
     PT_MONTHS={"Jan":"Jan","Feb":"Fev","Mar":"Mar","Apr":"Abr","May":"Mai",
                 "Jun":"Jun","Jul":"Jul","Aug":"Ago","Sep":"Set","Oct":"Out","Nov":"Nov","Dec":"Dez"}
-    df=df.copy(); df["ym"]=df["date"].dt.to_period("M")
+    df=df.copy()
+    df["date"]=pd.to_datetime(df["date"], errors="coerce")
+    df=df.dropna(subset=["date"])
+    if not len(df): return {"lbl":[],"totalS":[],"totalConv":[],"cpaG":[],"cpcG":[],"ctrG":[],"camps":[]}
+    df["ym"]=df["date"].dt.to_period("M")
     months=sorted(df["ym"].unique())
     out={"lbl":[],"totalS":[],"totalConv":[],"cpaG":[],"cpcG":[],"ctrG":[],"camps":[]}
     for m in months:
@@ -696,6 +863,25 @@ def inject_all(tpl, meta_k, meta_d, meta_dc, meta_raw_c, meta_t, meta_bd, meta_m
     html=replace_js_const(html,"GOOGLE_BD",      g_bd)
     html=replace_js_const(html,"GOOGLE_MONTHLY", g_month)
     html=replace_js_const(html,"GOOGLE_RAW",     g_raw)
+    # Moeda — injeta ou substitui dependendo do template
+    _ms = MOEDA_SIMBOLO
+    _mc = MOEDA
+    if "const MOEDA_SIMBOLO" not in html:
+        _inj = "const MOEDA_SIMBOLO  = '" + _ms + "';\nconst MOEDA_COD      = '" + _mc + "';\n\n// \u2550\u2550\u2550 CONFIG"
+        html = html.replace("// \u2550\u2550\u2550 CONFIG", _inj, 1)
+        _fr_old = "const fR=v=>(v==null||isNaN(v))?'\u2014':'R$'+Number(v).toLocaleString('pt-BR',{minimumFractionDigits:2,maximumFractionDigits:2});"
+        _fr_new = "function fR(v){if(v==null||isNaN(v))return'\u2014';const _lc=MOEDA_COD==='USD'?'en-US':MOEDA_COD==='EUR'?'de-DE':'pt-BR';const _n=Number(v).toLocaleString(_lc,{minimumFractionDigits:2,maximumFractionDigits:2});if(MOEDA_COD==='EUR')return _n+'\u20ac';return MOEDA_SIMBOLO+_n;}"
+        html = html.replace(_fr_old, _fr_new)
+        print("  Moeda injetada: " + _ms + " (" + _mc + ")")
+    else:
+        html=replace_js_const(html,"MOEDA_SIMBOLO", _ms)
+        html=replace_js_const(html,"MOEDA_COD",     _mc)
+    # Funil e Google
+    html=replace_js_const(html,"USAR_GOOGLE",      USAR_GOOGLE)
+    html=replace_js_const(html,"FUNIL_IMPRESSOES",  FUNIL_IMPRESSOES)
+    html=replace_js_const(html,"FUNIL_LINK_CLICKS", FUNIL_LINK_CLICKS)
+    html=replace_js_const(html,"FUNIL_PAGE_VIEW",   FUNIL_PAGE_VIEW)
+    html=replace_js_const(html,"FUNIL_LEADS",       FUNIL_LEADS)
     for k,v in [("LANCAMENTO_COD",f"'{LANCAMENTO_COD}'"),("NOME_CLIENTE",f"'{NOME_CLIENTE}'"),
                 ("LOGO_LETRA",f"'{LOGO_LETRA}'"),("COR_ACENTO",f"'{COR_ACENTO}'"),
                 ("CPL_BOM",str(CPL_BOM)),("CPL_MEDIO",str(CPL_MEDIO)),
@@ -729,13 +915,15 @@ def main():
     print("\n[GOOGLE ADS]")
     try:
         df_google=load_google()
-        g_daily=google_daily(df_google)
-        g_kpis=google_kpis(df_google)
-        g_camps=google_camps(df_google)
+        # Corrigir spend com google-ads-pesquisa antes de calcular KPIs/daily/monthly
+        df_google_corr=apply_pesq_spend(df_google)
+        g_daily=google_daily(df_google_corr)
+        g_kpis=google_kpis(df_google_corr)
+        g_camps=google_camps(df_google)  # usa dfp internamente
         g_kw=google_keywords(df_google)
         g_bd=google_breakdowns(df_google)
-        g_month=google_monthly(df_google)
-        g_raw=google_raw(df_google)
+        g_month=google_monthly(df_google_corr)
+        g_raw=google_raw(df_google_corr)
         print(f"  ✓ {df_google['conversions'].sum():.0f} conv. | R$ {df_google['spend'].sum():,.2f} invest.")
     except Exception as e:
         print(f"  Aviso Google: {e}")
